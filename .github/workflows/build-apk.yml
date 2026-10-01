@@ -1,0 +1,218 @@
+name: Build APK from ZIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "সোর্স কোডের ZIP লিংক (সরাসরি ডাউনলোড লিংক)"
+        required: true
+        type: string
+      build_type:
+        description: "বিল্ড টাইপ"
+        required: true
+        default: "release"
+        type: choice
+        options: ["release", "debug"]
+      java_version:
+        description: "JDK ভার্সন (Gradle 9.x এর জন্য 17+)"
+        required: false
+        default: "17"
+        type: choice
+        options: ["11", "17", "21"]
+      wrapper_version:
+        description: "Gradle Wrapper ভার্সন, যেমন 9.3.1 (wrapper না থাকলে তৈরি হবে; ফাঁকা রাখলে স্কিপ)"
+        required: false
+        default: ""
+        type: string
+      gradle_task:
+        description: "কাস্টম Gradle টাস্ক (ফাঁকা রাখলে বিল্ড টাইপ অনুযায়ী হবে)"
+        required: false
+        default: ""
+        type: string
+      strip_signing:
+        description: "release এর signingConfig বাদ দিয়ে নিশ্চিতভাবে unsigned APK বানানো"
+        required: false
+        default: true
+        type: boolean
+      project_dir:
+        description: "প্রজেক্ট ফোল্ডার (ফাঁকা রাখলে অটো-ডিটেক্ট হবে)"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: ZIP ডাউনলোড ও এক্সট্র্যাক্ট
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+        run: |
+          set -e
+          curl -fL --retry 3 -o source.zip "$ZIP_URL"
+          mkdir src
+          unzip -q source.zip -d src
+          echo "ZIP এক্সট্র্যাক্ট হয়েছে:"
+          ls -la src
+
+      - name: প্রজেক্ট রুট খুঁজে বের করা
+        id: root
+        env:
+          PROJECT_DIR: ${{ inputs.project_dir }}
+          WRAPPER_VERSION: ${{ inputs.wrapper_version }}
+        run: |
+          set -e
+          if [ -n "$PROJECT_DIR" ]; then
+            ROOT="src/$PROJECT_DIR"
+          else
+            # আগে gradlew খোঁজা, না পেলে settings.gradle(.kts)
+            ROOT=$(find src -maxdepth 4 -name gradlew -printf '%h\n' | awk '{print length, $0}' | sort -n | head -n1 | cut -d' ' -f2-)
+            if [ -z "$ROOT" ]; then
+              ROOT=$(find src -maxdepth 4 \( -name settings.gradle -o -name settings.gradle.kts \) -printf '%h\n' | awk '{print length, $0}' | sort -n | head -n1 | cut -d' ' -f2-)
+            fi
+          fi
+          if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
+            echo "::error::Gradle প্রজেক্ট খুঁজে পাওয়া যায়নি। project_dir ইনপুট দিন।"
+            exit 1
+          fi
+          echo "প্রজেক্ট রুট: $ROOT"
+          echo "path=$ROOT" >> "$GITHUB_OUTPUT"
+
+          if [ -f "$ROOT/gradlew" ]; then
+            chmod +x "$ROOT/gradlew"
+          fi
+
+          if [ -f "$ROOT/gradlew" ] && [ -f "$ROOT/gradle/wrapper/gradle-wrapper.jar" ]; then
+            echo "Gradle Wrapper আগে থেকেই আছে।"
+            echo "has_wrapper=true" >> "$GITHUB_OUTPUT"
+            echo "gen_wrapper=false" >> "$GITHUB_OUTPUT"
+            if [ -n "$WRAPPER_VERSION" ]; then
+              echo "::notice::Wrapper আগে থেকেই আছে, তাই $WRAPPER_VERSION ভার্সনের wrapper তৈরি করা হয়নি।"
+            fi
+          else
+            echo "Gradle Wrapper (gradlew / gradle-wrapper.jar) পাওয়া যায়নি।"
+            echo "has_wrapper=false" >> "$GITHUB_OUTPUT"
+            if [ -n "$WRAPPER_VERSION" ]; then
+              if ! echo "$WRAPPER_VERSION" | grep -Eq '^[0-9]+(\.[0-9]+){1,2}(-[A-Za-z0-9.]+)?$'; then
+                echo "::error::wrapper_version ফরম্যাট ঠিক নয় (উদাহরণ: 9.3.1)।"
+                exit 1
+              fi
+              echo "gen_wrapper=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "gen_wrapper=false" >> "$GITHUB_OUTPUT"
+              echo "::warning::Wrapper নেই এবং wrapper_version দেওয়া হয়নি, তাই সর্বশেষ Gradle ব্যবহার হবে।"
+            fi
+          fi
+
+      - name: JDK সেটআপ
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+
+      - name: Android SDK সেটআপ
+        uses: android-actions/setup-android@v3
+
+      - name: Gradle সেটআপ (wrapper না থাকলে)
+        if: steps.root.outputs.has_wrapper == 'false'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ inputs.wrapper_version != '' && inputs.wrapper_version || 'current' }}
+
+      - name: Gradle Wrapper তৈরি
+        if: steps.root.outputs.gen_wrapper == 'true'
+        working-directory: ${{ steps.root.outputs.path }}
+        env:
+          WRAPPER_VERSION: ${{ inputs.wrapper_version }}
+        run: |
+          set -e
+          echo "চালানো হচ্ছে: gradle wrapper --gradle-version $WRAPPER_VERSION"
+          gradle wrapper --gradle-version "$WRAPPER_VERSION" --no-daemon
+          chmod +x gradlew
+          ls -la gradlew gradle/wrapper
+
+      - name: APK বিল্ড (${{ inputs.build_type }})
+        working-directory: ${{ steps.root.outputs.path }}
+        env:
+          BUILD_TYPE: ${{ inputs.build_type }}
+          CUSTOM_TASK: ${{ inputs.gradle_task }}
+          STRIP_SIGNING: ${{ inputs.strip_signing }}
+        run: |
+          if [ -n "$CUSTOM_TASK" ]; then
+            TASK="$CUSTOM_TASK"
+          elif [ "$BUILD_TYPE" = "debug" ]; then
+            TASK="assembleDebug"
+          else
+            TASK="assembleRelease"
+          fi
+          echo "Gradle টাস্ক: $TASK"
+
+          # signingConfig বাদ দেওয়ার init script (debug টাইপ অক্ষত থাকে)
+          INIT_ARGS=()
+          if [ "$STRIP_SIGNING" = "true" ]; then
+            cat > "$RUNNER_TEMP/strip-signing.init.gradle" <<'GRADLE'
+          allprojects {
+              afterEvaluate { p ->
+                  def android = p.extensions.findByName("android")
+                  if (android == null) return
+                  android.buildTypes.each { bt ->
+                      if (bt.name != "debug" && bt.signingConfig != null) {
+                          println "[strip-signing] ${p.path}: buildType '${bt.name}' এর signingConfig সরানো হয়েছে"
+                          bt.signingConfig = null
+                      }
+                  }
+                  if (android.hasProperty("productFlavors")) {
+                      android.productFlavors.each { f ->
+                          if (f.signingConfig != null) {
+                              println "[strip-signing] ${p.path}: flavor '${f.name}' এর signingConfig সরানো হয়েছে"
+                              f.signingConfig = null
+                          }
+                      }
+                  }
+              }
+          }
+          GRADLE
+            INIT_ARGS=(-I "$RUNNER_TEMP/strip-signing.init.gradle")
+          fi
+
+          if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            chmod +x gradlew
+            ./gradlew "${INIT_ARGS[@]}" "$TASK" --stacktrace --no-daemon
+          else
+            gradle "${INIT_ARGS[@]}" "$TASK" --stacktrace --no-daemon
+          fi
+
+      - name: APK ফাইল সংগ্রহ
+        run: |
+          mkdir -p apk-out
+          find "${{ steps.root.outputs.path }}" -path '*build/outputs/apk/*' -name '*.apk' -exec cp {} apk-out/ \;
+          echo "পাওয়া APK:"
+          ls -lh apk-out
+          if [ -z "$(ls -A apk-out)" ]; then
+            echo "::error::কোনো APK পাওয়া যায়নি।"
+            exit 1
+          fi
+
+      - name: APK সাইন অবস্থা যাচাই
+        run: |
+          APKSIGNER=$(ls "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n1)
+          if [ -z "$APKSIGNER" ]; then
+            echo "apksigner পাওয়া যায়নি, যাচাই স্কিপ করা হলো।"
+            exit 0
+          fi
+          for f in apk-out/*.apk; do
+            if "$APKSIGNER" verify "$f" >/dev/null 2>&1; then
+              echo "$(basename "$f") → signed"
+            else
+              echo "$(basename "$f") → unsigned"
+            fi
+          done
+
+      - name: আর্টিফ্যাক্ট আপলোড
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.build_type }}-apk
+          path: apk-out/*.apk
+          if-no-files-found: error
