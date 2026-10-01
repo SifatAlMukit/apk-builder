@@ -114,6 +114,8 @@ jobs:
 
       - name: Android SDK সেটআপ
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
 
       - name: Gradle সেটআপ (wrapper না থাকলে)
         if: steps.root.outputs.has_wrapper == 'false'
